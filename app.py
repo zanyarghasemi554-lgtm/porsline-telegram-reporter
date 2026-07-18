@@ -172,11 +172,56 @@ def clean_header(value):
     return re.sub(r"[\s‌:\-_()（）]+", "", str(value or "")).lower()
 
 
+def header_label(header, index):
+    if isinstance(header, str):
+        return header
+    if isinstance(header, dict):
+        for key in (
+            "title", "name", "text", "label", "question_title", "question_text",
+            "alt_name", "display_name", "header",
+        ):
+            value = header.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+        for value in header.values():
+            if isinstance(value, dict):
+                nested = header_label(value, index)
+                if nested != f"column_{index}":
+                    return nested
+    return f"column_{index}"
+
+
+def scalar_value(value):
+    if not isinstance(value, dict):
+        return value
+    for key in ("value", "answer", "text", "name", "display_value", "response"):
+        candidate = value.get(key)
+        if candidate not in (None, "") and not isinstance(candidate, (dict, list)):
+            return candidate
+    return value
+
+
 def row_to_mapping(headers, row):
-    if isinstance(row, dict):
-        return row
+    labels = [header_label(header, i) for i, header in enumerate(headers)]
     if isinstance(row, list):
-        return {str(headers[i]): value for i, value in enumerate(row) if i < len(headers)}
+        return {labels[i]: scalar_value(value) for i, value in enumerate(row) if i < len(labels)}
+    if isinstance(row, dict):
+        result = {str(key): scalar_value(value) for key, value in row.items()}
+        nested_values = row.get("values") or row.get("answers") or row.get("cells")
+        if isinstance(nested_values, list):
+            result.update({labels[i]: scalar_value(value) for i, value in enumerate(nested_values) if i < len(labels)})
+        for i, header in enumerate(headers):
+            if not isinstance(header, dict):
+                continue
+            candidates = []
+            for key in ("id", "key", "column_id", "object_id", "question_id"):
+                if header.get(key) is not None:
+                    candidates.extend([header[key], str(header[key])])
+            for candidate in candidates:
+                if candidate in row:
+                    result[labels[i]] = scalar_value(row[candidate])
+                    break
+        return result
     raise ValueError(f"Unsupported Porsline row type: {type(row).__name__}")
 
 
@@ -311,6 +356,7 @@ def send_message(text):
 
 def collect_new_rows(code, survey_id):
     headers, rows, total = fetch_results(survey_id)
+    log.info("Survey %s headers: %s", code, [header_label(h, i) for i, h in enumerate(headers)])
     new_people = []
     keys = []
     for raw_row in rows:
@@ -320,7 +366,8 @@ def collect_new_rows(code, survey_id):
             continue
         person = extract_person(mapping)
         if not all(person.values()):
-            log.warning("Skipped incomplete response %s from survey %s", key, code)
+            missing = [name for name, value in person.items() if not value]
+            log.warning("Skipped incomplete response %s from survey %s; missing=%s", key, code, missing)
             continue
         new_people.append(person)
         keys.append((code, key))
@@ -382,6 +429,14 @@ def scheduled_check():
         log.exception("Scheduled report failed")
 
 
+def startup_check():
+    try:
+        result = run_report(force=True)
+        log.info("Startup check result: %s", result)
+    except Exception:
+        log.exception("Startup report failed")
+
+
 @app.get("/")
 @app.get("/health")
 def health():
@@ -411,7 +466,7 @@ def start_scheduler():
     )
     scheduler.start()
     if FIRST_RUN_IMMEDIATELY:
-        threading.Thread(target=scheduled_check, daemon=True).start()
+        threading.Thread(target=startup_check, daemon=True).start()
 
 
 if os.getenv("DISABLE_SCHEDULER", "false").lower() != "true":
