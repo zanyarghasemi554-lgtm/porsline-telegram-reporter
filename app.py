@@ -5,11 +5,15 @@ import json
 import logging
 import os
 import re
+import subprocess
+import sys
 import threading
 import base64
+import tempfile
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import psycopg
@@ -17,6 +21,7 @@ import requests
 from flask import Flask, jsonify, request
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
+from PIL import Image, ImageOps
 
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -26,6 +31,8 @@ app = Flask(__name__)
 RUN_LOCK = threading.Lock()
 BASE_DIR = Path(__file__).resolve().parent
 TEMPLATE_PATH = BASE_DIR / "assets" / "report-template.xlsx.b64"
+CERTIFICATE_TEMPLATE_PATH = BASE_DIR / "assets" / "certificate-template.pptx"
+CERTIFICATE_WORKER_PATH = BASE_DIR / "certificate_worker.py"
 
 PORSLINE_BASE_URL = os.getenv("PORSLINE_BASE_URL", "https://survey.porsline.ir").rstrip("/")
 PORSLINE_API_KEY = os.getenv("PORSLINE_API_KEY", "")
@@ -188,6 +195,13 @@ def init_db():
             )
             """
         )
+        for table in ("custom_forms", "builtin_forms"):
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS certificate_type TEXT NOT NULL DEFAULT 'nursing'")
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS course_title TEXT")
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS course_duration TEXT")
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS certificate_instructor TEXT")
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS certificate_venue TEXT")
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS certificate_organization TEXT")
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS report_batches (
@@ -227,6 +241,36 @@ def init_db():
         cur.execute("ALTER TABLE report_batch_items ADD COLUMN IF NOT EXISTS color_key TEXT NOT NULL DEFAULT 'white'")
         cur.execute("CREATE INDEX IF NOT EXISTS report_batch_items_person ON report_batch_items(national_id, persian_name)")
         cur.execute("CREATE INDEX IF NOT EXISTS report_batches_status ON report_batches(created_at DESC, nursing_received_at, posted_at)")
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS self_certificate_batches (
+                id BIGSERIAL PRIMARY KEY,
+                short_id TEXT UNIQUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                report_names TEXT NOT NULL,
+                row_count INTEGER NOT NULL,
+                output_mode TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'sent_to_printer'
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS self_certificate_items (
+                id BIGSERIAL PRIMARY KEY,
+                batch_id BIGINT NOT NULL REFERENCES self_certificate_batches(id) ON DELETE CASCADE,
+                survey_code TEXT NOT NULL,
+                response_key TEXT NOT NULL,
+                report_name TEXT NOT NULL,
+                teacher_name TEXT NOT NULL,
+                persian_name TEXT NOT NULL,
+                national_id TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE(survey_code, response_key)
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS self_certificate_person ON self_certificate_items(national_id, persian_name)")
         cur.execute("SELECT value FROM app_state WHERE key='teacher_catalog_seeded'")
         if not cur.fetchone():
             cur.executemany(
@@ -401,6 +445,47 @@ def get_form_records(active_only=True, teacher_name=None):
     return builtin + custom
 
 
+def get_form_settings(survey_code):
+    columns = (
+        "certificate_type, course_title, course_duration, certificate_instructor, "
+        "certificate_venue, certificate_organization"
+    )
+    with db() as conn, conn.cursor() as cur:
+        for source, table in (("builtin", "builtin_forms"), ("custom", "custom_forms")):
+            cur.execute(
+                f"SELECT report_name, teacher_name, {columns} FROM {table} WHERE survey_code=%s",
+                (survey_code,),
+            )
+            row = cur.fetchone()
+            if row:
+                return {
+                    "source": source, "survey_code": str(survey_code),
+                    "report_name": row[0], "teacher_name": row[1],
+                    "certificate_type": row[2] or "nursing", "course_title": row[3] or "",
+                    "course_duration": row[4] or "", "certificate_instructor": row[5] or "",
+                    "certificate_venue": row[6] or "", "certificate_organization": row[7] or "",
+                }
+    return None
+
+
+def update_form_certificate_settings(source, survey_code, settings):
+    table = "builtin_forms" if source == "builtin" else "custom_forms"
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            f"""UPDATE {table} SET certificate_type=%s, course_title=%s,
+                course_duration=%s, certificate_instructor=%s, certificate_venue=%s,
+                certificate_organization=%s WHERE survey_code=%s""",
+            (
+                settings.get("certificate_type", "nursing"), settings.get("course_title"),
+                settings.get("course_duration"), settings.get("certificate_instructor"),
+                settings.get("certificate_venue"), settings.get("certificate_organization"), survey_code,
+            ),
+        )
+        if cur.rowcount != 1:
+            raise ValueError("⚠️ فرم موردنظر پیدا نشد.")
+        conn.commit()
+
+
 def get_inactive_form_records():
     with db() as conn, conn.cursor() as cur:
         cur.execute(
@@ -520,8 +605,15 @@ def get_report_for_command(command):
     return tuple(row) if row else None
 
 
-def all_report_definitions():
-    return [(survey_code, report_name) for _source, survey_code, report_name, _teacher in get_form_records()]
+def all_report_definitions(certificate_type=None):
+    definitions = []
+    for _source, survey_code, report_name, _teacher in get_form_records():
+        if certificate_type:
+            settings = get_form_settings(survey_code)
+            if settings and settings["certificate_type"] != certificate_type:
+                continue
+        definitions.append((survey_code, report_name))
+    return definitions
 
 
 def custom_form_command(survey_code):
@@ -536,7 +628,8 @@ def custom_form_button_label(report_name, survey_code):
     return f"📋 {str(report_name)[:max_name_length]} • {suffix}"
 
 
-def save_custom_form(command, survey_code, report_name, user_id, teacher_name="اسکالپل"):
+def save_custom_form(command, survey_code, report_name, user_id, teacher_name="اسکالپل", settings=None):
+    settings = settings or {"certificate_type": "nursing"}
     with db() as conn, conn.cursor() as cur:
         cur.execute(
             "SELECT bot_command, survey_code, active FROM custom_forms WHERE survey_code=%s OR bot_command=%s",
@@ -549,20 +642,30 @@ def save_custom_form(command, survey_code, report_name, user_id, teacher_name="�
                 cur.execute(
                     """
                     UPDATE custom_forms
-                    SET active=TRUE, report_name=%s, created_by=%s, teacher_name=%s
+                    SET active=TRUE, report_name=%s, created_by=%s, teacher_name=%s,
+                        certificate_type=%s, course_title=%s, course_duration=%s,
+                        certificate_instructor=%s, certificate_venue=%s, certificate_organization=%s
                     WHERE bot_command=%s
                     """,
-                    (report_name, user_id, teacher_name, command),
+                    (report_name, user_id, teacher_name, settings.get("certificate_type", "nursing"),
+                     settings.get("course_title"), settings.get("course_duration"),
+                     settings.get("certificate_instructor"), settings.get("certificate_venue"),
+                     settings.get("certificate_organization"), command),
                 )
                 conn.commit()
                 return
             raise ValueError("این لینک یا دستور قبلاً ثبت شده است.")
         cur.execute(
             """
-            INSERT INTO custom_forms(bot_command, survey_code, report_name, created_by, teacher_name)
-            VALUES(%s, %s, %s, %s, %s)
+            INSERT INTO custom_forms(bot_command, survey_code, report_name, created_by, teacher_name,
+                certificate_type, course_title, course_duration, certificate_instructor,
+                certificate_venue, certificate_organization)
+            VALUES(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
-            (command, survey_code, report_name, user_id, teacher_name),
+            (command, survey_code, report_name, user_id, teacher_name,
+             settings.get("certificate_type", "nursing"), settings.get("course_title"),
+             settings.get("course_duration"), settings.get("certificate_instructor"),
+             settings.get("certificate_venue"), settings.get("certificate_organization")),
         )
         conn.commit()
 
@@ -678,7 +781,7 @@ def scalar_value(value):
         return "، ".join(str(scalar_value(item)) for item in value if item not in (None, ""))
     if not isinstance(value, dict):
         return value
-    for key in ("value", "answer", "text", "name", "display_value", "response", "result"):
+    for key in ("url", "file_url", "download_url", "value", "answer", "text", "name", "display_value", "response", "result"):
         candidate = value.get(key)
         if candidate not in (None, ""):
             return scalar_value(candidate)
@@ -773,6 +876,103 @@ def extract_person(mapping):
     }
 
 
+def extract_certificate_person(mapping):
+    person = extract_person(mapping)
+    gender = find_value(mapping, ["جنسیت", "gender"])
+    photo_candidates = {
+        clean_header("عکس خود را به صورت اسکن شده بارگزاری کنید."),
+        clean_header("عکس خود را به صورت اسکن شده بارگذاری کنید."),
+    }
+    photo_value = next(
+        (value for key, value in mapping.items()
+         if any(candidate == clean_header(key) or candidate in clean_header(key) for candidate in photo_candidates)),
+        "",
+    )
+    serialized = json.dumps(photo_value, ensure_ascii=False, default=str) if isinstance(photo_value, (dict, list)) else str(photo_value)
+    url_match = re.search(r"https?://[^\s'\"،\\]+", serialized)
+    person.update({"gender": gender, "photo_url": url_match.group(0) if url_match else ""})
+    return person
+
+
+def certificate_honorific(gender):
+    value = str(gender or "").strip().casefold()
+    if any(word in value for word in ("خانم", "زن", "female")):
+        return "خانم"
+    if any(word in value for word in ("آقا", "مرد", "male")):
+        return "آقای"
+    return ""
+
+
+def safe_filename(value):
+    cleaned = re.sub(r"[\\/:*?\"<>|\r\n]+", "-", str(value or "")).strip(" .-")
+    return cleaned[:100] or "مدارک"
+
+
+def download_portrait(url, target_path):
+    if not str(url or "").startswith(("http://", "https://")):
+        raise ValueError("آدرس عکس معتبر نیست")
+    source_host = urlparse(str(url)).hostname
+    porsline_host = urlparse(PORSLINE_BASE_URL).hostname
+    headers = {"Authorization": f"API-Key {PORSLINE_API_KEY}"} if source_host == porsline_host else {}
+    response = requests.get(url, headers=headers, timeout=90)
+    response.raise_for_status()
+    with Image.open(io.BytesIO(response.content)) as source:
+        image = ImageOps.exif_transpose(source).convert("RGB")
+        # نسبت دقیق قاب عکس در فایل نمونه؛ تصویر کامل می‌ماند و فقط حاشیه سفید می‌گیرد.
+        frame_ratio = 120.64 / 149.85
+        if image.width / image.height > frame_ratio:
+            canvas_size = (image.width, max(1, round(image.width / frame_ratio)))
+        else:
+            canvas_size = (max(1, round(image.height * frame_ratio)), image.height)
+        canvas = Image.new("RGB", canvas_size, "white")
+        canvas.paste(image, ((canvas.width - image.width) // 2, (canvas.height - image.height) // 2))
+        canvas.save(target_path, "PNG", optimize=True)
+
+
+def build_certificate_powerpoint(students, course_title):
+    if not CERTIFICATE_TEMPLATE_PATH.exists():
+        raise RuntimeError("قالب پاورپوینت مدارک در برنامه وجود ندارد.")
+    temp_dir = tempfile.TemporaryDirectory(prefix="porsline-certificates-")
+    root = Path(temp_dir.name)
+    prepared = []
+    successful = []
+    failed = []
+    try:
+        for index, student in enumerate(students, start=1):
+            portrait_path = root / f"portrait-{index}.png"
+            try:
+                download_portrait(student["photo_url"], portrait_path)
+            except Exception as exc:
+                log.warning("Could not download portrait for %s: %s", student["persian_name"], exc)
+                failed.append({"name": student["persian_name"], "reason": "عکس قابل دریافت یا خواندن نیست"})
+                continue
+            prepared.append({**student, "portrait_path": str(portrait_path)})
+            successful.append(student)
+        if not prepared:
+            return None, None, [], failed
+        dated = datetime.now(ZoneInfo(DISPLAY_TIMEZONE)).strftime("%Y-%m-%d")
+        filename = f"مدارک - {safe_filename(course_title)} - {dated} - {len(prepared)} نفر.pptx"
+        output_path = root / filename
+        config_path = root / "config.json"
+        config_path.write_text(json.dumps({
+            "template_path": str(CERTIFICATE_TEMPLATE_PATH),
+            "output_path": str(output_path),
+            "students": prepared,
+        }, ensure_ascii=False), encoding="utf-8")
+        process = subprocess.run(
+            [sys.executable, str(CERTIFICATE_WORKER_PATH), str(config_path)],
+            capture_output=True, text=True, timeout=300,
+        )
+        if process.returncode != 0 or not output_path.exists():
+            log.error("Certificate worker failed: %s", process.stderr[-3000:])
+            raise RuntimeError("ساخت فایل PowerPoint ناموفق بود.")
+        stream = io.BytesIO(output_path.read_bytes())
+        stream.seek(0)
+        return filename, stream, successful, failed
+    finally:
+        temp_dir.cleanup()
+
+
 def is_processed(survey_code, key):
     with db() as conn, conn.cursor() as cur:
         cur.execute(
@@ -780,6 +980,129 @@ def is_processed(survey_code, key):
             (survey_code, key),
         )
         return cur.fetchone() is not None
+
+
+def is_certificate_generated(survey_code, key):
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM self_certificate_items WHERE survey_code=%s AND response_key=%s",
+            (survey_code, key),
+        )
+        return cur.fetchone() is not None
+
+
+def record_certificate_batch(students, report_names, output_mode):
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """INSERT INTO self_certificate_batches(report_names, row_count, output_mode)
+               VALUES(%s, %s, %s) RETURNING id, created_at""",
+            (json.dumps(report_names, ensure_ascii=False), len(students), output_mode),
+        )
+        batch_id, created_at = cur.fetchone()
+        jy, jm, jd = gregorian_to_jalali(created_at.year, created_at.month, created_at.day)
+        short_id = f"P-{jy % 100:02d}{jm:02d}{jd:02d}-{batch_id}"
+        cur.execute("UPDATE self_certificate_batches SET short_id=%s WHERE id=%s", (short_id, batch_id))
+        cur.executemany(
+            """INSERT INTO self_certificate_items(
+                batch_id, survey_code, response_key, report_name, teacher_name, persian_name, national_id
+            ) VALUES(%s,%s,%s,%s,%s,%s,%s)""",
+            [(batch_id, row["survey_code"], row["response_key"], row["report_name"],
+              row["teacher_name"], row["persian_name"], row["national_id"]) for row in students],
+        )
+        conn.commit()
+    return short_id
+
+
+def collect_certificate_rows(code, survey_id, settings):
+    headers, rows, total = fetch_results(survey_id)
+    students, skipped = [], []
+    for raw_row in rows:
+        mapping = row_to_mapping(headers, raw_row)
+        key = response_key(mapping)
+        if is_certificate_generated(code, key):
+            continue
+        person = extract_certificate_person(mapping)
+        honorific = certificate_honorific(person.get("gender"))
+        missing = []
+        if not person.get("persian_name"):
+            missing.append("نام و نام خانوادگی فارسی")
+        if not person.get("national_id"):
+            missing.append("کد ملی")
+        if not honorific:
+            missing.append("جنسیت")
+        if not person.get("photo_url"):
+            missing.append("عکس")
+        if missing:
+            skipped.append({"name": person.get("persian_name") or f"پاسخ {key[:8]}", "reason": "، ".join(missing)})
+            continue
+        students.append({
+            **person, "honorific": honorific, "response_key": key, "survey_code": code,
+            "report_name": settings["report_name"], "teacher_name": settings["teacher_name"],
+            "course_title": settings["course_title"], "duration": settings["course_duration"],
+            "instructor": settings["certificate_instructor"], "venue": settings["certificate_venue"],
+            "organization": settings["certificate_organization"],
+        })
+    return students, skipped, total
+
+
+def send_skipped_certificates(skipped, chat_id=None):
+    if not skipped:
+        return
+    lines = ["⚠️ برای افراد زیر مدرک ساخته نشد:"]
+    lines.extend(f"• {item['name']}: {item['reason']}" for item in skipped)
+    send_message("\n".join(lines)[:4000], chat_id=chat_id)
+
+
+def run_certificate_export(survey_codes, output_mode="combined", chat_id=None):
+    if not RUN_LOCK.acquire(blocking=False):
+        return {"status": "already-running"}
+    try:
+        settings_list = [get_form_settings(code) for code in survey_codes]
+        if any(not item or item["certificate_type"] != "self" for item in settings_list):
+            raise ValueError("⚠️ فقط فرم‌هایی را انتخاب کنید که مدرکشان را خودتان صادر می‌کنید.")
+        ids = resolve_surveys(set(survey_codes))
+        grouped, all_skipped = [], []
+        for settings in settings_list:
+            students, skipped, _total = collect_certificate_rows(
+                settings["survey_code"], ids[settings["survey_code"]], settings
+            )
+            grouped.append((settings, students))
+            all_skipped.extend(skipped)
+        sent = []
+        groups = grouped if output_mode == "separate" else [(
+            {"course_title": " + ".join(dict.fromkeys(item[0]["course_title"] for item in grouped)),
+             "report_name": "چند فرم"},
+            [student for _settings, students in grouped for student in students],
+        )]
+        for settings, students in groups:
+            if not students:
+                continue
+            filename, stream, built_students, failed = build_certificate_powerpoint(
+                students, settings["course_title"]
+            )
+            all_skipped.extend(failed)
+            if not built_students:
+                continue
+            caption = (
+                f"🎓 مدارک آماده چاپ\nتعداد: {len(built_students)} نفر\n"
+                f"فرم‌ها: {'، '.join(dict.fromkeys(row['report_name'] for row in built_students))}\n"
+                "وضعیت: 🖨 ارسال‌شده به چاپخانه"
+            )
+            send_document(
+                filename, stream, caption, chat_id,
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            )
+            record_certificate_batch(
+                built_students, list(dict.fromkeys(row["report_name"] for row in built_students)), output_mode
+            )
+            mark_processed([(row["survey_code"], row["response_key"]) for row in built_students])
+            sent.append(filename)
+        send_skipped_certificates(all_skipped, chat_id)
+        if not sent:
+            send_message("ℹ️ ثبت جدیدِ کامل و قابل ساختی برای مدرک وجود نداشت.", chat_id=chat_id)
+        return {"status": "sent" if sent else "no-new-rows", "files": sent, "skipped": all_skipped}
+    finally:
+        RUN_LOCK.release()
 
 
 def mark_processed(items):
@@ -947,31 +1270,27 @@ def recent_batches(stage=None, limit=10):
     conditions = []
     if stage == "receive":
         conditions.append("nursing_received_at IS NULL")
-    elif stage == "post":
-        conditions.extend(["nursing_received_at IS NOT NULL", "posted_at IS NULL"])
     elif stage == "undo":
         conditions.append("nursing_received_at IS NOT NULL")
     where = " WHERE " + " AND ".join(conditions) if conditions else ""
     with db() as conn, conn.cursor() as cur:
         cur.execute(
             "SELECT id, short_id, created_at, report_names, row_count, is_combined, "
-            "nursing_received_at, posted_at FROM report_batches" + where +
+            "nursing_received_at FROM report_batches" + where +
             " ORDER BY created_at DESC LIMIT %s",
             (limit,),
         )
         return [{
             "id": row[0], "short_id": row[1], "created_at": row[2],
             "report_names": json.loads(row[3]), "row_count": row[4], "is_combined": row[5],
-            "nursing_received_at": row[6], "posted_at": row[7],
+            "nursing_received_at": row[6],
         } for row in cur.fetchall()]
 
 
 def update_batch_status(batch_id, action):
     assignments = {
         "receive": "nursing_received_at=NOW()",
-        "post": "posted_at=NOW()",
         "undo_receive": "nursing_received_at=NULL, posted_at=NULL",
-        "undo_post": "posted_at=NULL",
     }
     if action not in assignments:
         raise ValueError("⚠️ عملیات وضعیت معتبر نیست.")
@@ -987,7 +1306,7 @@ def get_batch(batch_id):
         cur.execute(
             """
             SELECT id, short_id, created_at, report_names, empty_report_names, row_count,
-                   is_combined, nursing_received_at, posted_at
+                   is_combined, nursing_received_at
             FROM report_batches WHERE id=%s
             """,
             (batch_id,),
@@ -999,7 +1318,6 @@ def get_batch(batch_id):
         "id": row[0], "short_id": row[1], "created_at": row[2],
         "report_names": json.loads(row[3]), "empty_names": json.loads(row[4]),
         "row_count": row[5], "is_combined": row[6], "nursing_received_at": row[7],
-        "posted_at": row[8],
     }
 
 
@@ -1009,65 +1327,6 @@ def delete_report_batch(batch_id):
         conn.commit()
 
 
-def resend_batch(batch_id, chat_id=None):
-    batch = get_batch(batch_id)
-    if not batch:
-        raise ValueError("⚠️ گزارش موردنظر پیدا نشد.")
-    rows = get_batch_items(batch_id)
-    dated = batch["created_at"].astimezone(ZoneInfo(DISPLAY_TIMEZONE)).strftime("%Y-%m-%d")
-    if batch["is_combined"]:
-        white_name, white_stream = build_report(rows, len(rows), f"گزارش نظام پرستاری - {dated}")
-        color_name, color_stream = build_report(rows, len(rows), f"گزارش ترکیبی رنگی - {dated}", colored=True)
-        send_document(
-            white_name, white_stream,
-            report_caption(rows, batch["report_names"], batch["empty_names"], batch["short_id"]), chat_id,
-        )
-        send_document(
-            color_name, color_stream,
-            report_caption(rows, batch["report_names"], batch["empty_names"], batch["short_id"], colored=True), chat_id,
-        )
-    else:
-        report_name = batch["report_names"][0] if batch["report_names"] else "گزارش"
-        filename, stream = build_report(rows, len(rows), report_name)
-        send_document(
-            filename, stream,
-            report_caption(rows, batch["report_names"], batch["empty_names"], batch["short_id"]), chat_id,
-        )
-
-
-def send_day_40_warnings():
-    require_settings()
-    init_db()
-    cutoff = datetime.now(timezone.utc) - timedelta(days=40)
-    with db() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT id, short_id, created_at, report_names, row_count
-            FROM report_batches
-            WHERE nursing_received_at IS NULL AND day_40_warning_sent_at IS NULL
-              AND created_at <= %s
-            ORDER BY created_at
-            """,
-            (cutoff,),
-        )
-        overdue = cur.fetchall()
-        if not overdue:
-            return 0
-        lines = ["⏰ هشدار ۴۰روزه مدارک نظام پرستاری:"]
-        for _id, short_id, created_at, names_json, row_count in overdue:
-            lines.append(
-                f"• {short_id} — {row_count} نفر — {format_sent_at(created_at)} — "
-                + "، ".join(json.loads(names_json))
-            )
-        send_message("\n".join(lines))
-        cur.execute(
-            "UPDATE report_batches SET day_40_warning_sent_at=NOW() WHERE id=ANY(%s)",
-            ([row[0] for row in overdue],),
-        )
-        conn.commit()
-    return len(overdue)
-
-
 def owner_chat_id():
     chat_id = get_state("bot_owner_chat_id")
     if not chat_id:
@@ -1075,11 +1334,11 @@ def owner_chat_id():
     return str(chat_id)
 
 
-def send_document(filename, stream, caption, chat_id=None):
+def send_document(filename, stream, caption, chat_id=None, mime_type=None):
     response = requests.post(
         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument",
         data={"chat_id": chat_id or owner_chat_id(), "caption": caption},
-        files={"document": (filename, stream, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+        files={"document": (filename, stream, mime_type or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
         timeout=120,
     )
     response.raise_for_status()
@@ -1199,7 +1458,7 @@ def run_report(include_processed=False, all_forms=False, selected_reports=None, 
             (TECHNICIAN_SURVEY_CODE, "تکنسین داروخانه"),
         ]
         if all_forms:
-            reports = all_report_definitions()
+            reports = all_report_definitions("nursing")
         ids = resolve_surveys({code for code, _ in reports})
         sent_files = []
         results = {}
@@ -1298,11 +1557,16 @@ def run_status():
     try:
         require_settings()
         init_db()
-        reports = all_report_definitions()
+        records = get_form_records()
+        reports = [(code, name) for _source, code, name, _teacher in records]
         ids = resolve_surveys({code for code, _ in reports})
         status_rows = []
         for code, report_name in reports:
-            people, _keys, total = collect_new_rows(code, ids[code])
+            settings = get_form_settings(code) or {"certificate_type": "nursing"}
+            if settings["certificate_type"] == "self":
+                people, _skipped, total = collect_certificate_rows(code, ids[code], settings)
+            else:
+                people, _keys, total = collect_new_rows(code, ids[code])
             status_rows.append((report_name, len(people), total))
         return status_rows
     finally:
@@ -1379,6 +1643,17 @@ def teacher_selection_menu():
     return {"keyboard": keyboard, "resize_keyboard": True, "one_time_keyboard": True}
 
 
+CERTIFICATE_TYPE_MENU = {
+    "keyboard": [
+        [{"text": "🏥 برای نظام پرستاری"}],
+        [{"text": "🎓 خودم مدرک صادر می‌کنم"}],
+        [{"text": "❌ انصراف"}],
+    ],
+    "resize_keyboard": True,
+    "one_time_keyboard": True,
+}
+
+
 MANAGEMENT_MENU = {
     "keyboard": [
         [{"text": "➕ ثبت فرم جدید"}],
@@ -1394,9 +1669,7 @@ MANAGEMENT_MENU = {
 NURSING_MENU = {
     "keyboard": [
         [{"text": "1️⃣ مدارک از نظام رسید"}],
-        [{"text": "2️⃣ مدارک را به پست دادم"}],
         [{"text": "📊 وضعیت گزارش‌های اخیر"}],
-        [{"text": "📥 دریافت دوباره فایل گزارش"}],
         [{"text": "↩️ اصلاح انتخاب اشتباه"}],
         [{"text": "📘 راهنمای این بخش"}],
         [{"text": "🔙 بازگشت به منوی اصلی"}],
@@ -1414,11 +1687,8 @@ def nursing_help_text():
         "از همان لحظه، وضعیت تمام افراد آن فایل «منتظر دریافت از نظام» است.\n\n"
         "1️⃣ وقتی مدارک همه افراد یک گزارش از نظام پرستاری به دست شما رسید:\n"
         "دکمه «مدارک از نظام رسید» را بزنید و همان گزارش را انتخاب کنید.\n\n"
-        "2️⃣ بعداً وقتی مدارک همه افراد همان گزارش را به اداره پست تحویل دادید:\n"
-        "دکمه «مدارک را به پست دادم» را بزنید و گزارش را انتخاب کنید.\n\n"
         "🔎 بعد از این کار، در جست‌وجوی هر فرد، مرحله و تاریخ مدرک او نمایش داده می‌شود.\n\n"
-        "↩️ اگر گزارش اشتباهی را انتخاب کردید، از «اصلاح انتخاب اشتباه» استفاده کنید.\n"
-        "📥 دریافت دوباره فایل فقط فایل قبلی را دوباره می‌فرستد و وضعیت افراد را تغییر نمی‌دهد."
+        "↩️ اگر گزارش اشتباهی را انتخاب کردید، از «اصلاح انتخاب اشتباه» استفاده کنید."
     )
 
 
@@ -1428,12 +1698,10 @@ def nursing_status_text(limit=10):
         return "📊 هنوز هیچ خروجی جدیدی برای پیگیری مدارک ثبت نشده است."
     lines = ["📊 وضعیت گزارش‌های اخیر:"]
     for batch in batches:
-        if batch["posted_at"]:
-            status = "📮 تحویل پست شده"
-        elif batch["nursing_received_at"]:
-            status = "✅ از نظام دریافت شده؛ منتظر پست"
+        if batch["nursing_received_at"]:
+            status = "✅ از نظام پرستاری دریافت شده"
         else:
-            status = "⏳ هنوز از نظام دریافت نشده"
+            status = "📤 به نظام پرستاری ارسال شده؛ هنوز دریافت نشده"
         names = "، ".join(batch["report_names"])
         lines.extend([
             "",
@@ -1460,13 +1728,17 @@ def teacher_color_selection_menu():
     return {"keyboard": keyboard, "resize_keyboard": True, "is_persistent": True}
 
 
-def multi_form_menu(selected_codes=None):
+def multi_form_menu(selected_codes=None, counts=None):
     selected_codes = set(selected_codes or [])
+    counts = counts or {}
     keyboard = []
     for _source, code, name, _teacher in get_form_records():
         digest = custom_form_command(code).removeprefix("/form_")
+        count = counts.get(code)
         mark = "✅" if code in selected_codes else "⬜"
-        keyboard.append([{"text": f"{mark} {name[:38]}", "callback_data": f"multi:toggle:{digest}"}])
+        count_text = f" — {count} جدید" if count is not None else ""
+        callback = f"multi:zero:{digest}" if count == 0 else f"multi:toggle:{digest}"
+        keyboard.append([{"text": f"{mark} {name[:32]}{count_text}", "callback_data": callback}])
     keyboard.extend([
         [
             {"text": "✅ انتخاب همه", "callback_data": "multi:all"},
@@ -1482,9 +1754,7 @@ def multi_form_menu(selected_codes=None):
 
 def batch_button_label(batch):
     names = "، ".join(batch["report_names"])
-    if batch.get("posted_at"):
-        icon = "📮"
-    elif batch.get("nursing_received_at"):
+    if batch.get("nursing_received_at"):
         icon = "✅"
     else:
         icon = "⏳"
@@ -1580,12 +1850,30 @@ CUSTOM_FORM_MENU = {
         [{"text": "🆕 فقط ثبت‌های جدید"}],
         [{"text": "📚 همه ثبت‌ها"}],
         [{"text": "✏️ ویرایش نام فرم"}],
+        [{"text": "⚙️ ویرایش مشخصات مدرک"}],
         [{"text": "🗑 غیرفعال‌کردن فرم"}],
         [{"text": "🔙 بازگشت به مدرس"}],
     ],
     "resize_keyboard": True,
     "is_persistent": True,
 }
+
+
+def custom_form_menu(survey_code):
+    settings = get_form_settings(survey_code)
+    if not settings or settings["certificate_type"] != "self":
+        return CUSTOM_FORM_MENU
+    return {
+        "keyboard": [
+            [{"text": "🎓 ساخت PowerPoint مدارک جدید"}],
+            [{"text": "✏️ ویرایش نام فرم"}],
+            [{"text": "⚙️ ویرایش مشخصات مدرک"}],
+            [{"text": "🗑 غیرفعال‌کردن فرم"}],
+            [{"text": "🔙 بازگشت به مدرس"}],
+        ],
+        "resize_keyboard": True,
+        "is_persistent": True,
+    }
 
 REGISTRATION_MENU = {
     "keyboard": [[{"text": "❌ لغو ثبت فرم"}], [{"text": "❌ انصراف"}]],
@@ -1622,7 +1910,7 @@ def request_export_confirmation(action, user_id, chat_id):
 def execute_export_action(action):
     title, reports, include_processed = EXPORT_ACTIONS[action]
     if action == "all_full":
-        reports = all_report_definitions()
+        reports = all_report_definitions("nursing")
     send_message(f"⏳ تأیید شد؛ در حال آماده‌سازی «{title}»…")
     result = run_report(
         include_processed=include_processed,
@@ -1636,13 +1924,17 @@ def request_custom_export_confirmation(mode, user_id, chat_id):
     if not selected.get("survey_code") or not selected.get("report_name"):
         send_message("⚠️ ابتدا فرم موردنظر را از منوی اصلی انتخاب کنید.", chat_id, main_menu())
         return
-    title = f"{'ثبت‌های جدید' if mode == 'new' else 'همه ثبت‌های'} فرم {selected['report_name']}"
+    settings = get_form_settings(selected["survey_code"])
+    self_issued = settings and settings["certificate_type"] == "self"
+    title = (f"PowerPoint مدارک جدید فرم {selected['report_name']}" if self_issued
+             else f"{'ثبت‌های جدید' if mode == 'new' else 'همه ثبت‌های'} فرم {selected['report_name']}")
     set_state(
         f"pending_button_action:{user_id}",
         json.dumps({
             "action": f"custom_{mode}",
             "survey_code": selected["survey_code"],
             "report_name": selected["report_name"],
+            "certificate_type": settings["certificate_type"] if settings else "nursing",
             "created_at": int(time.time()),
         }, ensure_ascii=False),
     )
@@ -1654,12 +1946,34 @@ def request_custom_export_confirmation(mode, user_id, chat_id):
 
 
 def execute_custom_export(pending):
+    if pending.get("certificate_type") == "self":
+        send_message(f"⏳ در حال ساخت PowerPoint دقیق مدارک فرم «{pending['report_name']}»…")
+        result = run_certificate_export([pending["survey_code"]])
+        log.info("Certificate export result: %s", result)
+        return
     include_processed = pending["action"] == "custom_full"
     report = (pending["survey_code"], pending["report_name"])
     mode_title = "همه ثبت‌ها" if include_processed else "ثبت‌های جدید"
     send_message(f"⏳ در حال آماده‌سازی {mode_title}ی فرم «{pending['report_name']}»…")
     result = run_report(include_processed=include_processed, selected_reports=[report])
     log.info("Custom form export result: %s", result)
+
+
+def form_new_counts(records):
+    ids = resolve_surveys({code for _source, code, _name, _teacher in records})
+    counts = {}
+    for _source, code, _name, _teacher in records:
+        settings = get_form_settings(code) or {"certificate_type": "nursing"}
+        headers, rows, _total = fetch_results(ids[code])
+        count = 0
+        for raw_row in rows:
+            key = response_key(row_to_mapping(headers, raw_row))
+            done = (is_certificate_generated(code, key) if settings["certificate_type"] == "self"
+                    else is_processed(code, key))
+            if not done:
+                count += 1
+        counts[code] = count
+    return counts
 
 
 def send_status():
@@ -1699,7 +2013,7 @@ def get_certificate_history(survey_code, response_keys):
     with db() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            SELECT i.response_key, b.short_id, b.created_at, b.nursing_received_at, b.posted_at
+            SELECT i.response_key, b.short_id, b.created_at, b.nursing_received_at
             FROM report_batch_items i
             JOIN report_batches b ON b.id=i.batch_id
             WHERE i.survey_code=%s AND i.response_key=ANY(%s)
@@ -1708,11 +2022,29 @@ def get_certificate_history(survey_code, response_keys):
             (survey_code, list(response_keys)),
         )
         result = {}
-        for key, short_id, created_at, received_at, posted_at in cur.fetchall():
+        for key, short_id, created_at, received_at in cur.fetchall():
             result.setdefault(key, []).append({
                 "short_id": short_id, "sent_at": created_at,
-                "received_at": received_at, "posted_at": posted_at,
+                "received_at": received_at,
             })
+        return result
+
+
+def get_self_certificate_history(survey_code, response_keys):
+    if not response_keys:
+        return {}
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """SELECT i.response_key, b.short_id, b.created_at
+               FROM self_certificate_items i
+               JOIN self_certificate_batches b ON b.id=i.batch_id
+               WHERE i.survey_code=%s AND i.response_key=ANY(%s)
+               ORDER BY b.created_at DESC""",
+            (survey_code, list(response_keys)),
+        )
+        result = {}
+        for key, short_id, created_at in cur.fetchall():
+            result.setdefault(key, []).append({"short_id": short_id, "sent_at": created_at})
         return result
 
 
@@ -1865,6 +2197,9 @@ def search_sent_registrations(query, limit=15):
             certificates = get_certificate_history(
                 survey_code, [key for key, _person, _submitted in candidates]
             )
+            self_certificates = get_self_certificate_history(
+                survey_code, [key for key, _person, _submitted in candidates]
+            )
             for key, person, submitted_at in candidates:
                 sent_at = processed.get(key)
                 if not sent_at:
@@ -1876,6 +2211,7 @@ def search_sent_registrations(query, limit=15):
                     "sent_at": sent_at,
                     "submitted_at": submitted_at,
                     "certificate_reports": certificates.get(key, []),
+                    "self_certificate_reports": self_certificates.get(key, []),
                 })
         matches.sort(key=lambda item: item["sent_at"], reverse=True)
         return matches[:limit], len(matches)
@@ -1914,18 +2250,21 @@ def process_registration_search(text, user_id, chat_id):
             f"📤 آخرین ارسال توسط ربات: {format_sent_at(item['sent_at'])}",
         ])
         histories = item.get("certificate_reports", [])
-        if not histories:
+        self_histories = item.get("self_certificate_reports", [])
+        if not histories and not self_histories:
             lines.append("🎓 وضعیت مدرک: این ارسال مربوط به قبل از ثبت تاریخچه جدید است")
+        for history in self_histories:
+            lines.extend([
+                f"🎓 گزارش {history['short_id']}: 🖨 PowerPoint ساخته و به چاپخانه ارسال شده",
+                f"🕒 تاریخ وضعیت: {format_sent_at(history['sent_at'])}",
+            ])
         for history in histories:
-            if history["posted_at"]:
-                status = "📮 مدرک تحویل پست شده"
-                status_date = format_sent_at(history["posted_at"])
-            elif history["received_at"]:
-                status = "✅ مدرک از نظام پرستاری تحویل گرفته شده؛ در انتظار پست"
+            if history["received_at"]:
+                status = "✅ مدرک از نظام پرستاری تحویل گرفته شده"
                 status_date = format_sent_at(history["received_at"])
             else:
-                status = "⏳ مدرک هنوز از نظام پرستاری تحویل گرفته نشده"
-                status_date = "—"
+                status = "📤 مدرک به نظام پرستاری ارسال شده؛ هنوز تحویل گرفته نشده"
+                status_date = format_sent_at(history["sent_at"])
             lines.extend([
                 f"🎓 گزارش {history['short_id']}: {status}",
                 f"🕒 تاریخ وضعیت: {status_date}",
@@ -2206,7 +2545,9 @@ def process_form_registration(text, user_id, chat_id, registration):
         if teacher_name not in get_teachers():
             send_message("⚠️ لطفاً یکی از مدرس‌های فهرست را انتخاب کنید.", chat_id, teacher_selection_menu())
             return
-        finish_form_registration(registration, teacher_name, user_id, chat_id)
+        registration.update({"step": "certificate_type", "teacher_name": teacher_name})
+        set_state(f"form_registration:{user_id}", json.dumps(registration, ensure_ascii=False))
+        send_message("🎓 مدرک این فرم چگونه صادر می‌شود؟", chat_id, CERTIFICATE_TYPE_MENU)
         return
     if registration.get("step") == "new_teacher":
         if text.strip() in get_teachers():
@@ -2233,18 +2574,63 @@ def process_form_registration(text, user_id, chat_id, registration):
             send_message("⚠️ یک رنگ در دسترس را انتخاب کنید.", chat_id, color_menu())
             return
         teacher_name = save_teacher(registration["teacher_name"], user_id, color_key)
-        finish_form_registration(registration, teacher_name, user_id, chat_id)
+        registration.update({"step": "certificate_type", "teacher_name": teacher_name})
+        set_state(f"form_registration:{user_id}", json.dumps(registration, ensure_ascii=False))
+        send_message("🎓 مدرک این فرم چگونه صادر می‌شود؟", chat_id, CERTIFICATE_TYPE_MENU)
+        return
+    if registration.get("step") == "certificate_type":
+        if text == "🏥 برای نظام پرستاری":
+            registration["certificate_type"] = "nursing"
+            finish_form_registration(registration, registration["teacher_name"], user_id, chat_id)
+            return
+        if text != "🎓 خودم مدرک صادر می‌کنم":
+            send_message("⚠️ یکی از دو نوع مدرک را انتخاب کنید.", chat_id, CERTIFICATE_TYPE_MENU)
+            return
+        registration.update({"step": "course_title", "certificate_type": "self"})
+        set_state(f"form_registration:{user_id}", json.dumps(registration, ensure_ascii=False))
+        send_message("📘 نام دوره‌ای که روی مدرک نوشته شود را وارد کنید:", chat_id, REGISTRATION_MENU)
+        return
+    prompts = {
+        "course_title": ("course_duration", "⏱ مدت دوره را دقیقاً همان‌طور که باید روی مدرک نوشته شود وارد کنید:"),
+        "course_duration": ("certificate_instructor", "👨‍🏫 نام مدرس روی مدرک را وارد کنید:"),
+        "certificate_instructor": ("certificate_venue", "📍 محل برگزاری را وارد کنید:"),
+        "certificate_venue": ("certificate_organization", "🏫 نام مجموعه آموزشی را وارد کنید:"),
+    }
+    if registration.get("step") in prompts:
+        value = str(text or "").strip()
+        if not value or len(value) > 150:
+            send_message("⚠️ این مقدار باید بین ۱ تا ۱۵۰ کاراکتر باشد.", chat_id, REGISTRATION_MENU)
+            return
+        current = registration["step"]
+        next_step, prompt = prompts[current]
+        registration[current] = value
+        registration["step"] = next_step
+        set_state(f"form_registration:{user_id}", json.dumps(registration, ensure_ascii=False))
+        send_message(prompt, chat_id, REGISTRATION_MENU)
+        return
+    if registration.get("step") == "certificate_organization":
+        value = str(text or "").strip()
+        if not value or len(value) > 150:
+            send_message("⚠️ نام مجموعه آموزشی باید بین ۱ تا ۱۵۰ کاراکتر باشد.", chat_id, REGISTRATION_MENU)
+            return
+        registration["certificate_organization"] = value
+        finish_form_registration(registration, registration["teacher_name"], user_id, chat_id)
 
 
 def finish_form_registration(registration, teacher_name, user_id, chat_id):
         report_name = registration["report_name"]
         survey_code = registration["survey_code"]
-        save_custom_form(
-            custom_form_command(survey_code), survey_code, report_name, user_id, teacher_name
-        )
+        if registration.get("editing_settings"):
+            update_form_certificate_settings(registration["source"], survey_code, registration)
+        else:
+            save_custom_form(
+                custom_form_command(survey_code), survey_code, report_name, user_id, teacher_name, registration
+            )
         set_state(f"form_registration:{user_id}", "{}")
         send_message(
-            f"✅ فرم «{report_name}» با موفقیت زیرمجموعه مدرس «{teacher_name}» ثبت شد.",
+            f"✅ مشخصات فرم «{report_name}» با موفقیت ذخیره شد.\n"
+            + ("نوع مدرک: ساخت PowerPoint توسط ربات" if registration.get("certificate_type") == "self"
+               else "نوع مدرک: نظام پرستاری"),
             chat_id,
             main_menu(),
         )
@@ -2301,13 +2687,11 @@ def process_teacher_setup(text, user_id, chat_id, setup):
 
 
 def start_batch_action(action, user_id, chat_id):
-    stage = {"receive": "receive", "post": "post", "redownload": None, "undo": "undo"}[action]
+    stage = {"receive": "receive", "undo": "undo"}[action]
     batches, menu = batch_selection_menu(stage)
     if not batches:
         messages = {
             "receive": "گزارشی در انتظار تحویل از نظام پرستاری نیست.",
-            "post": "گزارشی در انتظار تحویل به پست نیست.",
-            "redownload": "هنوز گزارش جدیدی در تاریخچه ثبت نشده است.",
             "undo": "وضعیتی برای بازگردانی وجود ندارد.",
         }
         send_message("ℹ️ " + messages[action], chat_id, NURSING_MENU)
@@ -2318,15 +2702,6 @@ def start_batch_action(action, user_id, chat_id):
             "1️⃣ ثبت دریافت مدارک از نظام پرستاری\n\n"
             "فقط گزارشی را انتخاب کنید که مدارک تمام افراد آن به دست شما رسیده است. "
             "بعد از انتخاب، یک تأیید نهایی هم می‌گیرم."
-        ),
-        "post": (
-            "2️⃣ ثبت تحویل مدارک به اداره پست\n\n"
-            "فقط گزارش‌هایی نمایش داده می‌شوند که قبلاً مرحله اولشان ثبت شده است. "
-            "گزارشی را انتخاب کنید که مدارک تمام افرادش را به پست تحویل داده‌اید."
-        ),
-        "redownload": (
-            "📥 دریافت دوباره فایل گزارش\n\n"
-            "انتخاب این گزینه هیچ وضعیتی را تغییر نمی‌دهد؛ فقط فایل قبلی دوباره ساخته و ارسال می‌شود."
         ),
         "undo": (
             "↩️ اصلاح انتخاب اشتباه\n\n"
@@ -2342,31 +2717,23 @@ def process_batch_selection(text, user_id, chat_id, action_state):
         send_message("🎓 مدیریت مدارک نظام پرستاری:", chat_id, NURSING_MENU)
         return
     action = action_state["action"]
-    stage = {"receive": "receive", "post": "post", "redownload": None, "undo": "undo"}[action]
+    stage = {"receive": "receive", "undo": "undo"}[action]
     batch = next((item for item in recent_batches(stage) if text == batch_button_label(item)), None)
     if not batch:
         _batches, menu = batch_selection_menu(stage)
         send_message("⚠️ یکی از گزارش‌های فهرست را انتخاب کنید.", chat_id, menu)
         return
     set_state(f"batch_action:{user_id}", "{}")
-    if action == "redownload":
-        send_message(f"⏳ در حال بازسازی گزارش {batch['short_id']}…", chat_id=chat_id)
-        resend_batch(batch["id"], chat_id)
-        send_message("✅ فایل گزارش دوباره ارسال شد.", chat_id, NURSING_MENU)
-        return
     set_state(
         f"pending_batch:{user_id}",
         json.dumps({"action": action, "batch_id": batch["id"], "created_at": int(time.time())}),
     )
     if action == "undo":
-        buttons = []
-        if batch.get("posted_at"):
-            buttons.append([{"text": "↩️ بازگشت به «تحویل از نظام»", "callback_data": "batch:undo_post"}])
-        buttons.append([{"text": "↩️ بازگشت به «در انتظار نظام»", "callback_data": "batch:undo_receive"}])
+        buttons = [[{"text": "↩️ بازگشت به «ارسال‌شده به نظام»", "callback_data": "batch:undo_receive"}]]
         buttons.append([{"text": "❌ انصراف", "callback_data": "cancel"}])
         send_message(f"وضعیت گزارش {batch['short_id']} به کدام مرحله برگردد؟", chat_id, {"inline_keyboard": buttons})
         return
-    title = "تحویل از نظام پرستاری" if action == "receive" else "تحویل به پست"
+    title = "تحویل‌گرفته‌شده از نظام پرستاری"
     markup = {"inline_keyboard": [[
         {"text": "✅ تأیید نهایی", "callback_data": f"batch:{action}"},
         {"text": "❌ انصراف", "callback_data": "cancel"},
@@ -2438,8 +2805,13 @@ def process_private_message(text, user_id, chat_id):
                 {"remove_keyboard": True},
             )
         elif text == "☑️ انتخاب چند فرم":
-            set_state(f"multi_form:{user_id}", json.dumps({"selected": [], "stage": "select"}))
-            send_message("☑️ حداقل دو فرم را انتخاب کنید:", chat_id, multi_form_menu())
+            send_message("⏳ در حال شمارش ثبت‌های جدید فرم‌ها…", chat_id=chat_id)
+            records_for_count = get_form_records()
+            counts = form_new_counts(records_for_count)
+            state = {"selected": [], "stage": "select", "counts": counts}
+            set_state(f"multi_form:{user_id}", json.dumps(state))
+            send_message("☑️ حداقل دو فرم را انتخاب کنید؛ فرم با عدد صفر قابل انتخاب نیست:",
+                         chat_id, multi_form_menu(counts=counts))
         elif text == "🎓 مدارک نظام پرستاری":
             send_message(nursing_help_text() + "\n\nاز کدام مرحله می‌خواهید استفاده کنید؟", chat_id, NURSING_MENU)
         elif text == "📘 راهنمای این بخش":
@@ -2448,10 +2820,6 @@ def process_private_message(text, user_id, chat_id):
             send_message(nursing_status_text(), chat_id, NURSING_MENU)
         elif text == "1️⃣ مدارک از نظام رسید":
             start_batch_action("receive", user_id, chat_id)
-        elif text == "2️⃣ مدارک را به پست دادم":
-            start_batch_action("post", user_id, chat_id)
-        elif text == "📥 دریافت دوباره فایل گزارش":
-            start_batch_action("redownload", user_id, chat_id)
         elif text == "↩️ اصلاح انتخاب اشتباه":
             start_batch_action("undo", user_id, chat_id)
         elif text == "➕ افزودن مدرس":
@@ -2518,13 +2886,24 @@ def process_private_message(text, user_id, chat_id):
                     "teacher_name": teacher_name,
                 }, ensure_ascii=False),
             )
-            send_message(f"📋 خروجی موردنظر برای فرم «{report_name}» را انتخاب کنید:", chat_id, CUSTOM_FORM_MENU)
+            send_message(f"📋 خروجی موردنظر برای فرم «{report_name}» را انتخاب کنید:",
+                         chat_id, custom_form_menu(survey_code))
+        elif text == "🎓 ساخت PowerPoint مدارک جدید":
+            request_custom_export_confirmation("new", user_id, chat_id)
         elif text == "🆕 فقط ثبت‌های جدید":
             request_custom_export_confirmation("new", user_id, chat_id)
         elif text == "📚 همه ثبت‌ها":
             request_custom_export_confirmation("full", user_id, chat_id)
         elif text == "✏️ ویرایش نام فرم":
             start_edit("form", user_id, chat_id)
+        elif text == "⚙️ ویرایش مشخصات مدرک":
+            selected = json.loads(get_state(f"selected_custom_form:{user_id}", "{}") or "{}")
+            settings = get_form_settings(selected.get("survey_code"))
+            if not settings:
+                raise ValueError("⚠️ ابتدا یک فرم را انتخاب کنید.")
+            settings.update({"step": "certificate_type", "editing_settings": True})
+            set_state(f"form_registration:{user_id}", json.dumps(settings, ensure_ascii=False))
+            send_message("🎓 نوع صدور مدرک این فرم را انتخاب کنید:", chat_id, CERTIFICATE_TYPE_MENU)
         elif text == "✏️ ویرایش نام مدرس":
             start_edit("teacher", user_id, chat_id)
         elif text == "🗑 غیرفعال‌کردن فرم":
@@ -2552,6 +2931,11 @@ def process_multi_callback(data, user_id, chat_id):
     if not state:
         state = {"selected": [], "stage": "select"}
     selected = list(state.get("selected", []))
+    counts = {str(key): int(value) for key, value in (state.get("counts") or {}).items()}
+    if data.startswith("multi:zero:"):
+        send_message("ℹ️ این فرم ثبت جدیدی ندارد و قابل انتخاب نیست.", chat_id,
+                     multi_form_menu(selected, counts))
+        return
     if data.startswith("multi:toggle:"):
         digest = data.rsplit(":", 1)[1]
         code = next((code for _source, code, _name, _teacher in records
@@ -2564,24 +2948,30 @@ def process_multi_callback(data, user_id, chat_id):
             selected.append(code)
         state.update({"selected": selected, "stage": "select"})
         set_state(state_key, json.dumps(state, ensure_ascii=False))
-        send_message(f"☑️ {len(selected)} فرم انتخاب شده است.", chat_id, multi_form_menu(selected))
+        send_message(f"☑️ {len(selected)} فرم انتخاب شده است.", chat_id, multi_form_menu(selected, counts))
         return
     if data == "multi:all":
-        selected = [code for _source, code, _name, _teacher in records]
+        selected = [code for _source, code, _name, _teacher in records if counts.get(code, 0) > 0]
         state.update({"selected": selected, "stage": "select"})
         set_state(state_key, json.dumps(state, ensure_ascii=False))
-        send_message("✅ همه فرم‌ها انتخاب شدند.", chat_id, multi_form_menu(selected))
+        send_message("✅ همه فرم‌های دارای ثبت جدید انتخاب شدند.", chat_id, multi_form_menu(selected, counts))
         return
     if data == "multi:clear":
         state.update({"selected": [], "stage": "select"})
         set_state(state_key, json.dumps(state, ensure_ascii=False))
-        send_message("🧹 انتخاب‌ها پاک شدند.", chat_id, multi_form_menu())
+        send_message("🧹 انتخاب‌ها پاک شدند.", chat_id, multi_form_menu(counts=counts))
         return
     chosen = [(code, name, teacher) for _source, code, name, teacher in records if code in selected]
     if data == "multi:continue":
         if len(chosen) < 2:
-            send_message("⚠️ برای گزارش چندفرمی حداقل دو فرم انتخاب کنید.", chat_id, multi_form_menu(selected))
+            send_message("⚠️ برای خروجی چندفرمی حداقل دو فرم انتخاب کنید.", chat_id, multi_form_menu(selected, counts))
             return
+        types = {get_form_settings(code)["certificate_type"] for code, _name, _teacher in chosen}
+        if len(types) != 1:
+            send_message("⚠️ فرم‌های نظام پرستاری و فرم‌های صدور شخصی را جداگانه انتخاب کنید.",
+                         chat_id, multi_form_menu(selected, counts))
+            return
+        state["certificate_type"] = next(iter(types))
         colors = get_teacher_colors()
         missing = sorted({teacher for _code, _name, teacher in chosen if not colors.get(teacher)})
         if missing:
@@ -2608,6 +2998,17 @@ def process_multi_callback(data, user_id, chat_id):
         state.update({"stage": 2, "created_at": int(time.time())})
         set_state(state_key, json.dumps(state, ensure_ascii=False))
         names = "، ".join(name for _code, name, _teacher in chosen)
+        if state.get("certificate_type") == "self":
+            markup = {"inline_keyboard": [
+                [{"text": "📚 یک فایل مشترک", "callback_data": "multi:cert_combined"}],
+                [{"text": "📂 فایل جدا برای هر فرم", "callback_data": "multi:cert_separate"}],
+                [{"text": "❌ انصراف", "callback_data": "cancel"}],
+            ]}
+            send_message(
+                f"⚠️ مرحله دوم — مدارک «{names}» به چه شکل ساخته شوند؟",
+                chat_id, markup,
+            )
+            return
         markup = {"inline_keyboard": [[
             {"text": "✅ ساخت دو فایل", "callback_data": "multi:second"},
             {"text": "❌ انصراف", "callback_data": "cancel"},
@@ -2616,6 +3017,23 @@ def process_multi_callback(data, user_id, chat_id):
             f"🚨 تأیید نهایی: ثبت‌های جدید «{names}» در یک گزارش سفید و یک گزارش رنگی ساخته شوند؟",
             chat_id, markup,
         )
+        return
+    if data in {"multi:cert_combined", "multi:cert_separate"} and state.get("stage") == 2:
+        mode = "combined" if data.endswith("combined") else "separate"
+        state.update({"stage": 3, "output_mode": mode, "created_at": int(time.time())})
+        set_state(state_key, json.dumps(state, ensure_ascii=False))
+        mode_title = "یک فایل مشترک" if mode == "combined" else "فایل جداگانه برای هر فرم"
+        markup = {"inline_keyboard": [[
+            {"text": "✅ تأیید نهایی و ساخت", "callback_data": "multi:cert_build"},
+            {"text": "❌ انصراف", "callback_data": "cancel"},
+        ]]}
+        send_message(f"🚨 تأیید نهایی: PowerPoint مدارک به صورت «{mode_title}» ساخته و ارسال شود؟",
+                     chat_id, markup)
+        return
+    if data == "multi:cert_build" and state.get("stage") == 3:
+        set_state(state_key, "{}")
+        send_message("⏳ در حال ساخت PowerPoint دقیق مدارک…", chat_id=chat_id)
+        run_certificate_export([code for code, _name, _teacher in chosen], state["output_mode"], chat_id)
         return
     if data == "multi:second" and state.get("stage") == 2:
         set_state(state_key, "{}")
@@ -2637,30 +3055,20 @@ def process_batch_callback(data, user_id, chat_id):
         raise ValueError("⚠️ گزارش موردنظر پیدا نشد.")
     action = data.removeprefix("batch:")
     if pending.get("action") == "undo":
-        if action not in {"undo_receive", "undo_post"}:
+        if action != "undo_receive":
             raise ValueError("⚠️ عملیات بازگردانی معتبر نیست.")
     elif action != pending.get("action"):
         raise ValueError("⚠️ عملیات تأییدشده با درخواست جاری مطابقت ندارد.")
     if action == "receive" and batch["nursing_received_at"] is not None:
         raise ValueError("⚠️ این گزارش قبلاً از نظام پرستاری تحویل گرفته شده است.")
-    if action == "post" and (batch["nursing_received_at"] is None or batch["posted_at"] is not None):
-        raise ValueError("⚠️ این گزارش در مرحله قابل تحویل به پست نیست.")
     update_batch_status(batch["id"], action)
     set_state(state_key, "{}")
     messages = {
         "receive": (
             "✅ ثبت شد: مدارک تمام افراد این گزارش از نظام پرستاری به دست شما رسیده است.\n\n"
-            "مرحله بعد: هر وقت مدارک همین گزارش را به اداره پست تحویل دادید، "
-            "دکمه «2️⃣ مدارک را به پست دادم» را بزنید."
+            "این وضعیت از این پس در جست‌وجوی افراد نمایش داده می‌شود."
         ),
-        "post": (
-            "📮 ثبت شد: مدارک تمام افراد این گزارش به اداره پست تحویل داده شده است.\n\n"
-            "از این پس در جست‌وجوی افراد همین وضعیت و تاریخ آن نمایش داده می‌شود."
-        ),
-        "undo_receive": "✅ اصلاح شد: گزارش دوباره به وضعیت «هنوز از نظام پرستاری دریافت نشده» برگشت.",
-        "undo_post": (
-            "✅ اصلاح شد: گزارش به مرحله «از نظام پرستاری دریافت شده، ولی هنوز به پست تحویل نشده» برگشت."
-        ),
+        "undo_receive": "✅ اصلاح شد: گزارش دوباره به وضعیت «ارسال‌شده به نظام؛ هنوز تحویل نگرفته‌اید» برگشت.",
     }
     send_message(messages[action], chat_id, NURSING_MENU)
 
@@ -2957,38 +3365,11 @@ def run_now():
         return jsonify({"ok": False, "error": str(exc)}), 500
 
 
-@app.post("/daily-check")
-def daily_check():
-    supplied = request.headers.get("X-App-Secret") or request.args.get("secret")
-    if not APP_SECRET or supplied != APP_SECRET:
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
-    try:
-        return jsonify({"ok": True, "warnings_sent": send_day_40_warnings()})
-    except Exception as exc:
-        log.exception("Daily certificate check failed")
-        return jsonify({"ok": False, "error": str(exc)}), 500
-
-
-def daily_warning_loop():
-    time.sleep(60)
-    while True:
-        try:
-            if DATABASE_URL and TELEGRAM_BOT_TOKEN:
-                send_day_40_warnings()
-        except Exception:
-            log.exception("Scheduled certificate warning check failed")
-        time.sleep(6 * 60 * 60)
-
-
 if TELEGRAM_POLLING_ENABLED and os.getenv("DISABLE_TELEGRAM_POLLING", "false").lower() != "true":
     threading.Thread(target=telegram_poll_loop, daemon=True).start()
 
 if WEBHOOK_BASE_URL and WEBHOOK_SECRET:
     threading.Thread(target=register_telegram_webhook, daemon=True).start()
-
-if os.getenv("DISABLE_TELEGRAM_POLLING", "false").lower() != "true":
-    threading.Thread(target=daily_warning_loop, daemon=True).start()
-
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
